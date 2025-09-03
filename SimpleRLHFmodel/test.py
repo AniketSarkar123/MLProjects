@@ -1,48 +1,31 @@
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import BertTokenizer, BertForSequenceClassification
 import torch
 
-# Load model & tokenizer
-model = BertForSequenceClassification.from_pretrained("checkpoints/reward")
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+# Generator: GPT-2
+gen_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+gen_model = AutoModelForCausalLM.from_pretrained("gpt2")
 
-# Long paragraph context
-context = """
-The Great Wall of China is a historic fortification built across northern China.
-It stretches over 13,000 miles and was constructed over several dynasties, mainly
-to protect against invasions. Today, it is considered one of the most iconic landmarks
-in the world and is even visible from space under certain conditions.
-"""
+# Reward model
+reward_tokenizer = BertTokenizer.from_pretrained("checkpoints/reward")
+reward_model = BertForSequenceClassification.from_pretrained("checkpoints/reward")
 
-# Example Q/A pairs
-examples = [
-    {
-        "question": "Why was the Great Wall of China built?",
-        "answer": "It was built to protect China from invasions and raids."
-    },
-    {
-        "question": "How tall is Mount Everest?",
-        "answer": "Mount Everest is about 8,849 meters tall."  # Wrong context
-    },
-    {
-        "question": "Is the Great Wall of China visible from space?",
-        "answer": "Yes, under certain conditions it can be seen from space."
-    },
-    {
-        "question": "Where is the Eiffel Tower located?",
-        "answer": "The Eiffel Tower is in Paris, France."  # Wrong context
-    }
-]
+context = """The Great Wall of China is a series of fortifications 
+built along the historical northern borders of China. 
+Its purpose was to protect against nomadic groups and invasions."""
+question = "Why was the Great Wall of China built?"
 
-# Run reward model
-for ex in examples:
-    combined_input = context + " " + ex["question"] + " " + ex["answer"]
-    inputs = tokenizer(combined_input, return_tensors="pt", truncation=True, padding=True)
+# Generator input = context + question
+gen_input_text = f"Context: {context}\nQuestion: {question}\nAnswer:"
+inputs = gen_tokenizer(gen_input_text, return_tensors="pt")
 
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        probs = torch.softmax(logits, dim=-1)
+# Generate multiple candidate answers
+outputs = gen_model.generate(**inputs, max_length=80, num_return_sequences=3, do_sample=True)
+candidates = [gen_tokenizer.decode(o, skip_special_tokens=True) for o in outputs]
 
-    print(f"Q: {ex['question']}")
-    print(f"A: {ex['answer']}")
-    print(" -> Probability of being a good answer:", probs[0][1].item())
-    print("-" * 80)
+# Score each candidate
+for ans in candidates:
+    pair = f"Context: {context}\nQuestion: {question}\nAnswer: {ans}"
+    tokens = reward_tokenizer(pair, return_tensors="pt", padding=True, truncation=True)
+    score = reward_model(**tokens).logits.softmax(dim=-1)[0][1].item()
+    print(f"Answer: {ans}\n -> Reward Score: {score}\n")
