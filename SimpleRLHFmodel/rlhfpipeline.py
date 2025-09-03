@@ -148,10 +148,20 @@ def load_causal_model(model_dir: str):
     return tokenizer, model
 
 
-def sample_answer(tokenizer, model, prompt: str, max_new_tokens: int = 128, do_sample: bool = True, temperature: float = 0.8) -> str:
+def sample_answer(tokenizer, model, prompt: str, max_new_tokens: int = 64,
+                  do_sample: bool = True, temperature: float = 0.8) -> str:
+    """
+    Generate a short, constrained answer for `prompt`.
+
+    Post-processes the decoded text to avoid the LM continuing with extra
+    questions or unrelated text. We trim after the first appearance of
+    likely "question" markers or blank-line separators.
+    """
+    # Tokenize & generate
     inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = inputs["input_ids"].to(model.device)
     attention_mask = inputs["attention_mask"].to(model.device)
+
     with torch.no_grad():
         out = model.generate(
             input_ids=input_ids,
@@ -161,51 +171,109 @@ def sample_answer(tokenizer, model, prompt: str, max_new_tokens: int = 128, do_s
             max_new_tokens=max_new_tokens,
             top_p=0.95,
             eos_token_id=tokenizer.eos_token_id,
+            # early_stopping True often helps stop generation at eos
+            early_stopping=True,
+            pad_token_id=tokenizer.eos_token_id,
         )
+
     text = tokenizer.decode(out[0], skip_special_tokens=True)
-    # return only the answer portion after the prompt
-    return text[len(prompt):].strip()
+    # extract generated portion after the prompt
+    gen = text[len(prompt):].strip()
 
+    # post-process: cut off if the model started generating new questions or Q/A blocks
+    # common markers to stop at:
+    stop_markers = ["\nQuestion:", "\nQuestion", "\n\nQuestion", "\n\nQ:", "\nQ:", "\nAnswer:", "\n\n", "\n- ", "\n\n-"]
+    cut_pos = None
+    for m in stop_markers:
+        idx = gen.find(m)
+        if idx != -1:
+            if cut_pos is None or idx < cut_pos:
+                cut_pos = idx
+    if cut_pos is not None:
+        gen = gen[:cut_pos].strip()
 
-def interactive_loop(model_dir: str):
-    tokenizer, model = load_causal_model(model_dir)
-    if torch.cuda.is_available():
-        model.to("cuda")
+    # further trim: stop at first occurrence of double newlines or multiple short Qs
+    # keep only the first 3 lines to avoid long tangents
+    lines = [l for l in gen.splitlines() if l.strip() != ""]
+    if len(lines) > 3:
+        gen = " ".join(lines[:3]).strip()
+    else:
+        gen = " ".join(lines).strip()
 
-    print("Interactive QA mode. Type 'exit' to stop.")
-    while True:
-        paragraph = input("Paste paragraph (or 'exit'):\n")
-        if paragraph.strip().lower() == "exit":
-            break
-        question = input("Question:\n")
-        if question.strip().lower() == "exit":
-            break
-        prompt = build_prompt(paragraph, question)
-        answer = sample_answer(tokenizer, model, prompt)
-        print("\nModel answer:\n" + answer + "\n")
+    # Remove trailing "Answer" or "Question" fragments if present
+    for suffix in ["Answer", "Answer:", "Question", "Question:"]:
+        if gen.endswith(suffix):
+            gen = gen[:-len(suffix)].strip()
 
+    return gen
 
 # ---------------------- Feedback collection -------------------------
 
-def collect_pairwise_feedback(model_dir: str, n_rounds: int = 20, out_file: str = "pref_journal.jsonl"):
+def collect_pairwise_feedback(model_dir: str, n_rounds: int = 2, out_file: str = "pref_journal.jsonl"):
+    """
+    Interactive pairwise feedback collector.
+
+    For each round:
+     - Ask user for paragraph and question (you type).
+     - Ask whether to auto-generate answers or to manually enter A/B.
+     - If auto: generate two short answers (using different sampling params).
+     - If manual: user types answers A and B directly.
+     - Save each round as {"prompt": prompt, "a": a, "b": b, "choice": choice}
+       into out_file (JSONL).
+    """
     tokenizer, model = load_causal_model(model_dir)
     if torch.cuda.is_available():
         model.to("cuda")
 
+    # load existing journal if present (so we append)
     journal = []
-    print("Pairwise preference collection. You will be shown two answers; enter 'a' or 'b' to indicate preference. Type 'q' to quit.")
+    if os.path.exists(out_file):
+        try:
+            journal = read_jsonl(out_file)
+        except Exception:
+            journal = []
+
+    print("Pairwise preference collection.")
+    print("You'll be asked to paste a paragraph and a question.")
+    print("For answers: choose auto-generation or manual entry. Type 'q' to quit at any prompt.")
 
     for i in range(n_rounds):
         print(f"\n=== Round {i+1}/{n_rounds} ===")
         paragraph = input("Paste paragraph (or 'q' to quit):\n")
         if paragraph.strip().lower() == 'q':
             break
-        question = input("Question:\n")
+        question = input("Question (or 'q' to quit):\n")
+        if question.strip().lower() == 'q':
+            break
+
         prompt = build_prompt(paragraph, question)
 
-        # produce two different answers by varying sampling strategy
-        a = sample_answer(tokenizer, model, prompt, do_sample=True, temperature=0.9)
-        b = sample_answer(tokenizer, model, prompt, do_sample=True, temperature=0.6)
+        # Ask whether to auto-generate answers or input manually
+        gen_or_manual = None
+        while gen_or_manual not in ("g", "m", "q"):
+            gen_or_manual = input("Generate answers with model or Manual entry? (g = generate, m = manual, q = quit): ").strip().lower()
+            if gen_or_manual == 'q':
+                break
+        if gen_or_manual == 'q':
+            break
+
+        if gen_or_manual == "g":
+            # produce two different answers by varying sampling strategy
+            a = sample_answer(tokenizer, model, prompt, do_sample=True, temperature=0.9, max_new_tokens=64)
+            b = sample_answer(tokenizer, model, prompt, do_sample=True, temperature=0.6, max_new_tokens=48)
+            # if generation returned empty, prompt user to enter manually
+            if not a:
+                print("Model produced empty Answer A — please type Answer A manually:")
+                a = input("Answer A:\n")
+            if not b:
+                print("Model produced empty Answer B — please type Answer B manually:")
+                b = input("Answer B:\n")
+        else:
+            # manual input mode
+            print("Enter Answer A (manual):")
+            a = input().strip()
+            print("Enter Answer B (manual):")
+            b = input().strip()
 
         print("\n----- Answer A -----\n")
         print(a)
@@ -223,86 +291,12 @@ def collect_pairwise_feedback(model_dir: str, n_rounds: int = 20, out_file: str 
         entry = {"prompt": prompt, "a": a, "b": b, "choice": choice}
         journal.append(entry)
 
-    write_jsonl(out_file, journal)
-    print(f"Saved feedback to {out_file}")
+        # append to file incrementally (so you don't lose data if script stops)
+        write_jsonl(out_file, journal)
+        print(f"Saved {len(journal)} preference(s) to {out_file}")
 
+    print("Feedback collection finished.")
 
-# ------------------------- Reward model -----------------------------
-
-def train_reward_model(
-    feedback_file: str,
-    model_name: str,
-    out_dir: str,
-    epochs: int = 3,
-    per_device_train_batch_size: int = 8
-):
-    # Load prefs.jsonl
-    data = read_jsonl(feedback_file)
-    examples = {"text": [], "label": []}
-
-    # Build pairs
-    for d in data:
-        prompt = d["prompt"]
-        a = prompt + d["a"]
-        b = prompt + d["b"]
-
-        if d["choice"] == "a":
-            examples["text"].append(a); examples["label"].append(1)  # chosen
-            examples["text"].append(b); examples["label"].append(0)  # rejected
-        else:
-            examples["text"].append(a); examples["label"].append(0)
-            examples["text"].append(b); examples["label"].append(1)
-
-    hf_ds = Dataset.from_dict(examples)
-
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-
-    def tokenize_fn(batch):
-        return tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=512,
-            padding="max_length"
-        )
-
-    tokenized = hf_ds.map(tokenize_fn, batched=True, remove_columns=["text"])
-
-    # Model with 2 labels (classification)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
-    model.resize_token_embeddings(len(tokenizer))
-    if getattr(model.config, "pad_token_id", None) is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
-    # Collator
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
-
-    # Training args
-    training_args = TrainingArguments(
-        output_dir=out_dir,
-        num_train_epochs=epochs,
-        per_device_train_batch_size=per_device_train_batch_size,
-        save_strategy="epoch",
-        logging_steps=10,
-        learning_rate=2e-5,
-        remove_unused_columns=False,
-    )
-
-    # Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-    )
-
-    # Train + save
-    trainer.train()
-    trainer.save_model(out_dir)
-    tokenizer.save_pretrained(out_dir)
 
 # ------------------------- PPO training -----------------------------
 
